@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""
+pega_openspan_jobs.py
+
+- Scrapes public job listings for Pega/OpenSpan roles in Bangalore from:
+  Naukri, Cutshort, AngelList, LinkedIn (public search)
+- Builds an HTML table and emails it via Gmail SMTP.
+
+Usage: Ensure environment variables (used by GitHub Actions or local run):
+  - SMTP_padmanabhreddy047@gmail.com
+  - SMTP_umdggexyqpygbbpp
+  - ALERT_padmanabhareddy047@gmail.com
+
+"""
+
+import os
+import time
+import requests
+from bs4 import BeautifulSoup
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from urllib.parse import quote_plus, urljoin
+from datetime import datetime
+
+# Config
+KEYWORDS = ["Pega", "OpenSpan", "Pega Robotics", "RPA Developer"]
+LOCATION = "Bangalore"
+MAX_PER_SOURCE = 8   # limit results per source to keep email concise
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT")
+
+HEADERS = {"User-Agent": USER_AGENT}
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+
+# ---------- scrapers ----------
+def scrape_naukri(keyword, location=LOCATION, limit=MAX_PER_SOURCE):
+    """Scrape Naukri search results (public listing pages)."""
+    out = []
+    q = f"{keyword} jobs in {location}"
+    url = f"https://www.naukri.com/{quote_plus(keyword)}-jobs-in-{location.lower()}"
+    try:
+        r = SESSION.get(url, timeout=12)
+        soup = BeautifulSoup(r.text, "html.parser")
+        cards = soup.select("article.jobTuple") or soup.select(".jobTuple") or soup.select("li.search-result")
+        for c in cards[:limit]:
+            # title
+            t = c.select_one("a.title") or c.select_one("a")
+            title = t.get_text(strip=True) if t else "Naukri listing"
+            link = t["href"] if t and t.has_attr("href") else (c.select_one("a")["href"] if c.select_one("a") and c.select_one("a").has_attr("href") else url)
+            company = (c.select_one(".subTitle") or c.select_one(".company") or c.select_one(".companyName"))
+            company = company.get_text(strip=True) if company else ""
+            loc = (c.select_one(".location") or c.select_one(".loc")) 
+            loc = loc.get_text(strip=True) if loc else location
+            date_tag = c.select_one(".date") or c.select_one(".postedDate")
+            posted = date_tag.get_text(strip=True) if date_tag else datetime.now().strftime("%d %b %Y")
+            out.append({"title": title, "company": company, "location": loc, "link": link, "date": posted, "source": "Naukri"})
+    except Exception as e:
+        # fallback: return empty and continue
+        print("Naukri scrape error:", e)
+    return out
+
+
+def scrape_cutshort(keyword, location=LOCATION, limit=MAX_PER_SOURCE):
+    """Scrape Cutshort public job pages."""
+    out = []
+    base = "https://cutshort.io"
+    try:
+        query = quote_plus(f"{keyword} {location}")
+        url = f"{base}/jobs?q={query}"
+        r = SESSION.get(url, timeout=12)
+        soup = BeautifulSoup(r.text, "html.parser")
+        cards = soup.select("div.job-card") or soup.select(".JobCard") or soup.select(".job")
+        for c in cards[:limit]:
+            t = c.select_one("h3") or c.select_one("a.job-title")
+            title = t.get_text(strip=True) if t else f"{keyword} - Cutshort"
+            link_tag = c.select_one("a")
+            link = urljoin(base, link_tag["href"]) if link_tag and link_tag.has_attr("href") else url
+            company = c.select_one(".company-name") or c.select_one("h4")
+            company = company.get_text(strip=True) if company else ""
+            loc = c.select_one(".loc") or c.select_one(".locations")
+            loc = loc.get_text(strip=True) if loc else location
+            posted = c.select_one(".posted") or c.select_one(".job-posted")
+            posted = posted.get_text(strip=True) if posted else datetime.now().strftime("%d %b %Y")
+            out.append({"title": title, "company": company, "location": loc, "link": link, "date": posted, "source": "Cutshort"})
+    except Exception as e:
+        print("Cutshort scrape error:", e)
+    return out
+
+
+def scrape_angellist(keyword, location=LOCATION, limit=MAX_PER_SOURCE):
+    """Scrape AngelList (angel.co) public job listings via search page."""
+    out = []
+    try:
+        base = "https://angel.co"
+        q = quote_plus(f"{keyword} {location}")
+        url = f"https://angel.co/jobs?query={q}"
+        r = SESSION.get(url, timeout=12)
+        soup = BeautifulSoup(r.text, "html.parser")
+        cards = soup.select("div.job-card") or soup.select(".styles_jobCard")
+        for c in cards[:limit]:
+            t = c.select_one("a") or c.select_one("h4")
+            title = t.get_text(strip=True) if t else f"{keyword} - AngelList"
+            link = urljoin(base, t["href"]) if t and t.has_attr("href") else url
+            company = c.select_one(".company-name") or c.select_one(".styles_companyName")
+            company = company.get_text(strip=True) if company else ""
+            loc = c.select_one(".location") or ""
+            loc = loc.get_text(strip=True) if loc else location
+            posted = datetime.now().strftime("%d %b %Y")
+            out.append({"title": title, "company": company, "location": loc, "link": link, "date": posted, "source": "AngelList"})
+    except Exception as e:
+        print("AngelList scrape error:", e)
+    return out
+
+
+def google_site_search(keyword, sites, limit=6):
+    """Fallback: search Google results for site: queries and parse results.
+       NOTE: scraping Google may be rate-limited; used as fallback only."""
+    out = []
+    try:
+        q_sites = " OR ".join([f"site:{s}" for s in sites])
+        query = f'{keyword} {LOCATION} ({q_sites})'
+        url = f"https://www.google.com/search?q={quote_plus(query)}&num={limit}"
+        r = SESSION.get(url, timeout=12)
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = soup.select(".tF2Cxc") or soup.select(".g")
+        for res in results[:limit]:
+            a = res.select_one("a")
+            h3 = res.select_one("h3")
+            snippet = res.select_one(".aCOpRe") or res.select_one(".st")
+            title = h3.get_text(strip=True) if h3 else (a.get_text(strip=True) if a else keyword)
+            link = a["href"] if a and a.has_attr("href") else ""
+            snippet_text = snippet.get_text(strip=True) if snippet else ""
+            out.append({"title": title, "company": "", "location": LOCATION, "link": link, "date": datetime.now().strftime("%d %b %Y"), "snippet": snippet_text, "source": "Google"})
+    except Exception as e:
+        print("Google search error:", e)
+    return out
+
+
+# ---------- utilities ----------
+def dedupe_jobs(jobs):
+    seen = set()
+    out = []
+    for j in jobs:
+        key = (j.get("link") or j.get("title")).strip()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(j)
+    return out
+
+
+def filter_by_experience_and_company_size(jobs):
+    # Heuristic: we already limited sources to startup-friendly sites.
+    # If you have a company-size CSV/API, you can refine here.
+    return jobs
+
+
+def build_html_table(jobs):
+    rows = ""
+    for job in jobs:
+        title = job.get("title", "")[:200]
+        link = job.get("link", "#")
+        company = job.get("company", "") or job.get("source", "")
+        loc = job.get("location", LOCATION)
+        date = job.get("date", "")
+        rows += f"<tr><td><a href='{link}' target='_blank'>{title}</a></td><td>{company}</td><td>{loc}</td><td>{date}</td></tr>\n"
+
+    html = f"""
+    <html>
+      <body>
+        <h2>Pega / OpenSpan Job Alerts — {LOCATION} — {datetime.now().strftime('%d %b %Y')}</h2>
+        <p>Sources: Naukri · Cutshort · AngelList · LinkedIn (public) · Google site: fallback</p>
+        <table style="border-collapse:collapse; width:100%;" border="1" cellpadding="6">
+          <thead>
+            <tr style="background:#f2f2f2;"><th>Title</th><th>Company</th><th>Location</th><th>Posted</th></tr>
+          </thead>
+          <tbody>
+            {rows if rows else '<tr><td colspan="4">No matching jobs found today.</td></tr>'}
+          </tbody>
+        </table>
+        <p style="font-size:12px; color:#666;">This is an automated alert — adjust filters in the script if needed.</p>
+      </body>
+    </html>
+    """
+    return html
+
+
+def send_email_html(subject, html):
+    if not (SMTP_USER and SMTP_PASS and ALERT_RECIPIENT):
+        raise SystemExit("SMTP_USER, SMTP_PASS and ALERT_RECIPIENT must be set as environment variables.")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = ALERT_RECIPIENT
+    msg.attach(MIMEText(html, "html"))
+
+    # Use TLS on 587
+    import smtplib
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, ALERT_RECIPIENT, msg.as_string())
+
+
+# ---------- main ----------
+def main():
+    all_jobs = []
+
+    for kw in KEYWORDS:
+        all_jobs += scrape_naukri(kw)
+        time.sleep(1.2)
+        all_jobs += scrape_cutshort(kw)
+        time.sleep(1.2)
+        all_jobs += scrape_angellist(kw)
+        time.sleep(1.2)
+
+    # fallback using Google site: to catch LinkedIn results & other missed results
+    sites_fallback = ["linkedin.com", "naukri.com", "cutshort.io", "angel.co"]
+    for kw in KEYWORDS:
+        all_jobs += google_site_search(kw, sites_fallback, limit=5)
+        time.sleep(1.0)
+
+    # basic filtering & dedupe
+    all_jobs = dedupe_jobs(all_jobs)
+    all_jobs = filter_by_experience_and_company_size(all_jobs)
+
+    # limit final results
+    MAX_FINAL = 20
+    final = all_jobs[:MAX_FINAL]
+
+    html = build_html_table(final)
+    subject = f"Pega/OpenSpan Jobs — {LOCATION} — {len(final)} results — {datetime.now().strftime('%d %b %Y')}"
+
+    try:
+        send_email_html(subject, html)
+        print(f"Sent email with {len(final)} results to {ALERT_RECIPIENT}")
+    except Exception as e:
+        print("Failed to send email:", e)
+
+
+if __name__ == "__main__":
+    main()
+name: Pega/OpenSpan Job Alerts
+
+on:
+  schedule:
+    - cron: "30 12 * * *"  # 12:30 UTC = 18:00 IST
+  workflow_dispatch:
+
+jobs:
+  job-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run job alert script
+        env:
+          SMTP_USER: ${{ secrets.SMTP_padmanabhareddy047@gmail.com }}
+          SMTP_PASS: ${{ secrets.SMTP_umdggexyqpygbbpp
+ }}
+          ALERT_RECIPIENT: ${{ secrets.ALERT_RECIPIENT }}
+        run: python pega_openspan_jobs.py
